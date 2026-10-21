@@ -1,8 +1,6 @@
-name: Build Panel
+name: Build bottom panel APK
 
-on:
-  push:
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 
 permissions:
   contents: write
@@ -64,7 +62,7 @@ jobs:
                   applicationId 'com.example.panel'
                   minSdk 29
                   targetSdk 29
-                  versionCode 12
+                  versionCode ${GITHUB_RUN_NUMBER:-1}
                   versionName '1.5'
               }
               compileOptions {
