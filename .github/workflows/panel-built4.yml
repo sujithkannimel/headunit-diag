@@ -1,0 +1,841 @@
+name: Build bottom panel APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.4'
+
+      - name: Reuse the same signing key between builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+          restore-keys: debug-keystore-
+
+      - name: Create project files
+        run: |
+          mkdir -p panel/app/src/main/java/com/example/panel
+          cd panel
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Panel"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          # Note: versionCode is dynamically generated from the GitHub run number
+          cat > app/build.gradle <<EOF
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'com.example.panel'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.panel'
+                  minSdk 29
+                  targetSdk 29
+                  versionCode ${GITHUB_RUN_NUMBER:-1}
+                  versionName '1.3'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              
+              <!-- Required for Android 11+ to see other apps like Maps and App Grid -->
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+                  <package android:name="com.google.android.apps.maps" />
+              </queries>
+
+              <application
+                  android:label="Bottom Panel"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <activity
+                      android:name=".AppsActivity"
+                      android:exported="false"
+                      android:theme="@android:style/Theme.Material.NoActionBar" />
+                  <service
+                      android:name=".PanelService"
+                      android:exported="false" />
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="true">
+                      <intent-filter>
+                          <!-- Standard Boot Signals -->
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="android.intent.action.USER_PRESENT" />
+                          
+                          <!-- K2401 / NWD / Gemstone Wake Signals -->
+                          <action android:name="com.nwd.action.ACC_ON" />
+                          <action android:name="com.nwd.action.SLEEP_OUT" />
+                          <action android:name="android.intent.action.ACC_ON" />
+                          <action android:name="com.tw.action.ACC_ON" />
+                          
+                          <!-- Generic System Wake Signals (Highly Reliable) -->
+                          <action android:name="android.net.conn.CONNECTIVITY_CHANGE" />
+                          <action android:name="android.intent.action.TIME_SET" />
+                          <action android:name="android.intent.action.TIMEZONE_CHANGED" />
+                          <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/panel/BootReceiver.java <<'EOF'
+          package com.example.panel;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.provider.Settings;
+
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context c, Intent i) {
+                  String action = i == null ? "(null intent)" : String.valueOf(i.getAction());
+                  boolean ping = "com.example.panel.PING".equals(action);
+                  SharedPreferences p = c.getSharedPreferences("p", 0);
+
+                  // log every NON-ping broadcast so we can see what the unit sends
+                  if (!ping) {
+                      PanelService.log(c, "broadcast received: " + action);
+                  }
+
+                  if (ping) {
+                      if (!p.getBoolean("wanted", false)) return;
+                  } else {
+                      // Check if this is a real "Boot" signal (cold start)
+                      boolean isBootSignal = action.equals("android.intent.action.BOOT_COMPLETED") ||
+                                             action.equals("android.intent.action.QUICKBOOT_POWERON") ||
+                                             action.equals("com.htc.intent.action.QUICKBOOT_POWERON");
+                                             
+                      // If it's a real boot, obey the user's "Auto-start" toggle.
+                      // If it's a wake signal (ACC_ON, TIME_SET, etc), ALWAYS start the panel.
+                      if (isBootSignal && !p.getBoolean("boot", true)) {
+                          PanelService.log(c, "boot start disabled in app");
+                          return;
+                      }
+                  }
+                  
+                  if (!Settings.canDrawOverlays(c)) {
+                      PanelService.log(c, "overlay permission missing - start skipped");
+                      return;
+                  }
+                  
+                  // If the service is already running and healthy, don't spam it
+                  if (!ping && PanelService.isRunning()) {
+                      return;
+                  }
+
+                  Intent s = new Intent(c, PanelService.class);
+                  if (ping) s.setAction("ping");
+                  try {
+                      c.startForegroundService(s);
+                      if (!ping) PanelService.log(c, "service started from broadcast");
+                  } catch (Exception e) {
+                      PanelService.log(c, "startForegroundService failed: " + e);
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/panel/PanelService.java <<'EOF'
+          package com.example.panel;
+
+          import android.app.AlarmManager;
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.IntentFilter;
+          import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.PixelFormat;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.os.SystemClock;
+          import android.provider.Settings;
+          import android.util.DisplayMetrics;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.view.WindowManager;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.TextClock;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
+
+          public class PanelService extends Service {
+              private static final int W = ViewGroup.LayoutParams.WRAP_CONTENT;
+              private static final int M = ViewGroup.LayoutParams.MATCH_PARENT;
+              private static String lastMsg = null;
+              private static volatile boolean isRunning = false;
+
+              // >>> CHANGE THIS to your radio app's package name <<<
+              private static final String RADIO_PKG = "com.your.radio";
+
+              private WindowManager wm;
+              private View panel;
+              private View handle;
+              private BroadcastReceiver screenReceiver;
+              private boolean hidden = false;
+              private float dens = 1f;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private final Runnable watchdog = new Runnable() {
+                  @Override
+                  public void run() {
+                      check();
+                      handler.postDelayed(this, 1500);
+                  }
+              };
+
+              public static boolean isRunning() {
+                  return isRunning;
+              }
+
+              public static void log(Context c, String m) {
+                  if (m.equals(lastMsg)) return;
+                  lastMsg = m;
+                  SharedPreferences p = c.getSharedPreferences("p", 0);
+                  String line = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date()) + " " + m;
+                  String[] old = p.getString("log", "").split("\n");
+                  StringBuilder sb = new StringBuilder(line);
+                  for (int k = 0; k < old.length && k < 11; k++) {
+                      if (!old[k].isEmpty()) sb.append("\n").append(old[k]);
+                  }
+                  p.edit().putString("log", sb.toString()).apply();
+              }
+
+              private static PendingIntent pingIntent(Context c) {
+                  Intent i = new Intent(c, BootReceiver.class);
+                  i.setAction("com.example.panel.PING");
+                  return PendingIntent.getBroadcast(c, 0, i, PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+              }
+
+              public static void schedulePing(Context c) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  long triggerAt = SystemClock.elapsedRealtime() + 5 * 60000; // 5 minutes fallback
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pingIntent(c));
+                  } else {
+                      am.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pingIntent(c));
+                  }
+              }
+
+              public static void cancelPing(Context c) {
+                  AlarmManager am = (AlarmManager) c.getSystemService(Context.ALARM_SERVICE);
+                  am.cancel(pingIntent(c));
+              }
+
+              @Override
+              public IBinder onBind(Intent i) {
+                  return null;
+              }
+
+              @Override
+              public int onStartCommand(Intent i, int f, int id) {
+                  isRunning = true;
+                  boolean ping = i != null && "ping".equals(i.getAction());
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  nm.createNotificationChannel(new NotificationChannel("panel", "Bottom panel",
+                          NotificationManager.IMPORTANCE_MIN));
+                  Notification n = new Notification.Builder(this, "panel")
+                          .setContentTitle("Bottom panel is running")
+                          .setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .build();
+                  startForeground(1, n);
+                  
+                  if (!Settings.canDrawOverlays(this)) {
+                      log(this, "overlay permission missing");
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  
+                  wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+                  dens = getResources().getDisplayMetrics().density;
+                  getSharedPreferences("p", 0).edit().putBoolean("wanted", true).apply();
+                  schedulePing(this);
+                  registerScreenReceiver();
+                  
+                  if (ping && (panel != null || handle != null)) {
+                      return START_STICKY;
+                  }
+                  
+                  log(this, i == null ? "service restarted by system"
+                          : ping ? "service revived by keep-alive" : "service started");
+                  hidden = false;
+                  build();
+                  
+                  if (!ping) maybeLaunchRadio();
+                  handler.removeCallbacks(watchdog);
+                  handler.postDelayed(watchdog, 1500);
+                  return START_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  isRunning = false;
+                  handler.removeCallbacks(watchdog);
+                  if (screenReceiver != null) {
+                      try {
+                          unregisterReceiver(screenReceiver);
+                      } catch (Exception ignored) {
+                      }
+                      screenReceiver = null;
+                  }
+                  log(this, "service destroyed");
+                  clear();
+                  super.onDestroy();
+              }
+
+              private void registerScreenReceiver() {
+                  if (screenReceiver != null) return;
+                  screenReceiver = new BroadcastReceiver() {
+                      @Override
+                      public void onReceive(Context c, Intent i) {
+                          if (!Intent.ACTION_SCREEN_ON.equals(i.getAction()) || wm == null) return;
+                          if (!hidden && (panel == null || !panel.isAttachedToWindow())) {
+                              log(PanelService.this, "screen on - re-adding panel");
+                              build();
+                          } else if (hidden && (handle == null || !handle.isAttachedToWindow())) {
+                              log(PanelService.this, "screen on - re-adding handle");
+                              build();
+                          }
+                      }
+                  };
+                  try {
+                      registerReceiver(screenReceiver, new IntentFilter(Intent.ACTION_SCREEN_ON));
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              private void check() {
+                  if (wm == null) return;
+                  if (hidden) {
+                      if (handle != null && handle.isAttachedToWindow()) {
+                          // Window is healthy
+                      } else {
+                          log(this, "handle missing - re-adding");
+                          build();
+                      }
+                  } else {
+                      if (panel != null && panel.isAttachedToWindow()) {
+                          // Window is healthy
+                      } else {
+                          log(this, "panel window gone - re-adding");
+                          build();
+                      }
+                  }
+              }
+
+              private int px(float dp) {
+                  return Math.round(dp * dens);
+              }
+
+              private void remove(View v) {
+                  if (v != null && wm != null) {
+                      try {
+                          wm.removeView(v);
+                      } catch (Exception ignored) {
+                      }
+                  }
+              }
+
+              private void clear() {
+                  remove(panel);
+                  remove(handle);
+                  panel = null;
+                  handle = null;
+              }
+
+              private WindowManager.LayoutParams lp(int w, int h, int gravity, int x, int y) {
+                  WindowManager.LayoutParams l = new WindowManager.LayoutParams(w, h,
+                          WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                          WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                                  | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
+                                  | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                          PixelFormat.TRANSLUCENT); // TRANSLUCENT allows rounded corners to look clean
+                  l.gravity = gravity;
+                  l.x = x;
+                  l.y = y;
+                  return l;
+              }
+
+              private void build() {
+                  clear();
+                  SharedPreferences p = getSharedPreferences("p", 0);
+                  int hDp = p.getInt("height", 170);
+                  int sDp = p.getInt("side", 200);
+                  DisplayMetrics real = new DisplayMetrics();
+                  wm.getDefaultDisplay().getRealMetrics(real);
+                  if (hidden) {
+                      addHandle(real);
+                  } else {
+                      addPanel(real, hDp, sDp);
+                  }
+              }
+
+              private void addHandle(DisplayMetrics real) {
+                  TextView t = new TextView(this);
+                  t.setText("Show panel");
+                  t.setTextColor(Color.WHITE);
+                  t.setTextSize(16);
+                  t.setGravity(Gravity.CENTER);
+                  t.setBackgroundColor(Color.rgb(60, 66, 76));
+                  t.setOnClickListener(v -> {
+                      hidden = false;
+                      build();
+                  });
+                  int h = px(44);
+                  try {
+                      wm.addView(t, lp(px(150), h, Gravity.TOP | Gravity.CENTER_HORIZONTAL, 0, real.heightPixels - h));
+                      handle = t;
+                  } catch (Exception e) {
+                      log(this, "handle addView failed: " + e);
+                  }
+              }
+
+              private void addPanel(DisplayMetrics real, int hDp, int sDp) {
+                  int h = px(hDp);
+                  int size = px(Math.max(40, Math.min(100, hDp - 20)));
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(Color.rgb(16, 20, 24));
+                  root.setPadding(px(sDp), 0, px(sDp), 0);
+
+                  LinearLayout left = row();
+                  left.addView(tile("Home", Color.rgb(240, 110, 60), size, v -> goHome()));
+                  left.addView(tile("Apps", Color.rgb(40, 110, 230), size,
+                          v -> go(new Intent(this, AppsActivity.class))));
+                  root.addView(left, new FrameLayout.LayoutParams(W, W, Gravity.START | Gravity.CENTER_VERTICAL));
+
+                  LinearLayout clock = new LinearLayout(this);
+                  clock.setOrientation(LinearLayout.VERTICAL);
+                  clock.setGravity(Gravity.CENTER_HORIZONTAL);
+                  TextClock time = new TextClock(this);
+                  time.setFormat12Hour("h:mm");
+                  time.setFormat24Hour("HH:mm");
+                  time.setTextColor(Color.WHITE);
+                  time.setTextSize(44);
+                  time.setTypeface(Typeface.DEFAULT_BOLD);
+                  time.setGravity(Gravity.CENTER);
+                  TextClock date = new TextClock(this);
+                  date.setFormat12Hour("EEE, d MMM yyyy");
+                  date.setFormat24Hour("EEE, d MMM yyyy");
+                  date.setTextColor(Color.rgb(180, 190, 200));
+                  date.setTextSize(16);
+                  date.setGravity(Gravity.CENTER);
+                  clock.addView(time, new LinearLayout.LayoutParams(W, W));
+                  clock.addView(date, new LinearLayout.LayoutParams(W, W));
+                  root.addView(clock, new FrameLayout.LayoutParams(W, W, Gravity.CENTER));
+
+                  LinearLayout right = row();
+                  right.addView(tile("Maps", Color.rgb(0, 150, 160), size, v -> openMaps()));
+                  right.addView(tile("Phone", Color.rgb(50, 180, 70), size,
+                          v -> go(new Intent(Intent.ACTION_DIAL))));
+                  right.addView(tile("Hide", Color.rgb(90, 98, 110), size, v -> {
+                      hidden = true;
+                      build();
+                  }));
+                  root.addView(right, new FrameLayout.LayoutParams(W, W, Gravity.END | Gravity.CENTER_VERTICAL));
+
+                  try {
+                      wm.addView(root, lp(M, h, Gravity.TOP | Gravity.LEFT, 0, real.heightPixels - h));
+                      panel = root;
+                  } catch (Exception e) {
+                      log(this, "panel addView failed: " + e);
+                  }
+              }
+
+              private LinearLayout row() {
+                  LinearLayout l = new LinearLayout(this);
+                  l.setOrientation(LinearLayout.HORIZONTAL);
+                  l.setGravity(Gravity.CENTER_VERTICAL);
+                  return l;
+              }
+
+              private TextView tile(String label, int color, int size, View.OnClickListener l) {
+                  TextView t = new TextView(this);
+                  t.setText(label);
+                  t.setTextColor(Color.WHITE);
+                  t.setTextSize(17);
+                  t.setTypeface(Typeface.DEFAULT_BOLD);
+                  t.setGravity(Gravity.CENTER);
+                  GradientDrawable g = new GradientDrawable();
+                  g.setColor(color);
+                  g.setCornerRadius(px(16));
+                  t.setBackground(g);
+                  LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(size, size);
+                  p.setMargins(px(6), 0, px(6), 0);
+                  t.setLayoutParams(p);
+                  t.setOnClickListener(l);
+                  return t;
+              }
+
+              private void go(Intent i) {
+                  try {
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      startActivity(i);
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Cannot open: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void goHome() {
+                  Intent h = new Intent(Intent.ACTION_MAIN);
+                  h.addCategory(Intent.CATEGORY_HOME);
+                  go(h);
+              }
+
+              private void openMaps() {
+                  Intent m = getPackageManager().getLaunchIntentForPackage("com.google.android.apps.maps");
+                  if (m == null) {
+                      m = new Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q="));
+                  }
+                  go(m);
+              }
+
+              private void maybeLaunchRadio() {
+                  long bootTime = System.currentTimeMillis() - SystemClock.elapsedRealtime();
+                  SharedPreferences p = getSharedPreferences("p", 0);
+                  long lastLaunch = p.getLong("lastBootLaunch", 0);
+                  if (Math.abs(bootTime - lastLaunch) < 60000) return;
+                  p.edit().putLong("lastBootLaunch", bootTime).apply();
+                  handler.postDelayed(() -> {
+                      Intent i = getPackageManager().getLaunchIntentForPackage(RADIO_PKG);
+                      if (i != null) {
+                          i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          try {
+                              startActivity(i);
+                              log(this, "launched radio app");
+                          } catch (Exception e) {
+                              log(this, "radio launch failed: " + e);
+                          }
+                      } else {
+                          log(this, "radio package not found: " + RADIO_PKG);
+                      }
+                  }, 4000);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/panel/AppsActivity.java <<'EOF'
+          package com.example.panel;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.content.pm.ResolveInfo;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.BaseAdapter;
+          import android.widget.GridView;
+          import android.widget.ImageView;
+          import android.widget.LinearLayout;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.Collections;
+          import java.util.List;
+
+          public class AppsActivity extends Activity {
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  final PackageManager pm = getPackageManager();
+                  Intent mi = new Intent(Intent.ACTION_MAIN);
+                  mi.addCategory(Intent.CATEGORY_LAUNCHER);
+                  final List<ResolveInfo> apps = pm.queryIntentActivities(mi, 0);
+                  Collections.sort(apps, new ResolveInfo.DisplayNameComparator(pm));
+                  final float d = getResources().getDisplayMetrics().density;
+
+                  GridView g = new GridView(this);
+                  g.setBackgroundColor(Color.rgb(16, 20, 24));
+                  g.setNumColumns(6);
+                  int pad = (int) (16 * d);
+                  g.setPadding(pad, pad, pad, pad);
+                  g.setVerticalSpacing((int) (12 * d));
+                  g.setAdapter(new BaseAdapter() {
+                      @Override
+                      public int getCount() {
+                          return apps.size();
+                      }
+
+                      @Override
+                      public Object getItem(int i) {
+                          return apps.get(i);
+                      }
+
+                      @Override
+                      public long getItemId(int i) {
+                          return i;
+                      }
+
+                      @Override
+                      public View getView(int i, View c, ViewGroup parent) {
+                          ResolveInfo ri = apps.get(i);
+                          LinearLayout l = new LinearLayout(AppsActivity.this);
+                          l.setOrientation(LinearLayout.VERTICAL);
+                          l.setGravity(Gravity.CENTER_HORIZONTAL);
+                          ImageView iv = new ImageView(AppsActivity.this);
+                          iv.setImageDrawable(ri.loadIcon(pm));
+                          l.addView(iv, new LinearLayout.LayoutParams((int) (56 * d), (int) (56 * d)));
+                          TextView t = new TextView(AppsActivity.this);
+                          t.setText(ri.loadLabel(pm));
+                          t.setTextColor(Color.WHITE);
+                          t.setTextSize(12);
+                          t.setSingleLine(true);
+                          t.setGravity(Gravity.CENTER);
+                          l.addView(t, new LinearLayout.LayoutParams(
+                                  ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                          return l;
+                      }
+                  });
+                  g.setOnItemClickListener((parent, v, i, id) -> {
+                      ResolveInfo ri = apps.get(i);
+                      Intent li = new Intent(Intent.ACTION_MAIN);
+                      li.addCategory(Intent.CATEGORY_LAUNCHER);
+                      li.setClassName(ri.activityInfo.packageName, ri.activityInfo.name);
+                      li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      try {
+                          startActivity(li);
+                      } catch (Exception e) {
+                          Toast.makeText(this, "Cannot open: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                      }
+                      finish();
+                  });
+                  setContentView(g);
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/panel/MainActivity.java <<'EOF'
+          package com.example.panel;
+
+          import android.app.Activity;
+          import android.content.ActivityNotFoundException;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.graphics.Typeface;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+              private SharedPreferences p;
+              private TextView status;
+              private TextView hTv;
+              private TextView sTv;
+              private TextView logTv;
+              private Button bootBtn;
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  p = getSharedPreferences("p", 0);
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(24, 24, 24, 24);
+
+                  status = new TextView(this);
+                  status.setTextSize(15);
+                  root.addView(status);
+
+                  root.addView(btn("1) Grant overlay permission", v -> askOverlay()));
+                  root.addView(btn("2) Start / refresh panel", v -> startPanel()));
+                  root.addView(btn("Stop panel", v -> stopPanel()));
+
+                  hTv = new TextView(this);
+                  hTv.setTextSize(16);
+                  hTv.setGravity(Gravity.CENTER);
+                  root.addView(stepper(hTv, "height", 170, 60, 250, 10));
+
+                  sTv = new TextView(this);
+                  sTv.setTextSize(16);
+                  sTv.setGravity(Gravity.CENTER);
+                  root.addView(stepper(sTv, "side", 200, 0, 400, 20));
+
+                  bootBtn = btn("", v -> {
+                      p.edit().putBoolean("boot", !p.getBoolean("boot", true)).apply();
+                      refresh();
+                  });
+                  root.addView(bootBtn);
+                  root.addView(btn("Open app grid", v -> startActivity(new Intent(this, AppsActivity.class))));
+                  root.addView(btn("Refresh log", v -> refresh()));
+
+                  logTv = new TextView(this);
+                  logTv.setTextSize(13);
+                  logTv.setTypeface(Typeface.MONOSPACE);
+                  root.addView(logTv);
+
+                  sv.addView(root);
+                  setContentView(sv);
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  refresh();
+              }
+
+              private Button btn(String t, View.OnClickListener l) {
+                  Button x = new Button(this);
+                  x.setText(t);
+                  x.setAllCaps(false);
+                  x.setOnClickListener(l);
+                  return x;
+              }
+
+              private LinearLayout stepper(TextView label, String key, int def, int min, int max, int step) {
+                  LinearLayout r = new LinearLayout(this);
+                  r.setOrientation(LinearLayout.HORIZONTAL);
+                  r.addView(btn("-", v -> change(key, def, -step, min, max)));
+                  r.addView(label, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+                  r.addView(btn("+", v -> change(key, def, step, min, max)));
+                  return r;
+              }
+
+              private void change(String key, int def, int delta, int min, int max) {
+                  int v = Math.max(min, Math.min(max, p.getInt(key, def) + delta));
+                  p.edit().putInt(key, v).apply();
+                  refresh();
+                  if (Settings.canDrawOverlays(this)) {
+                      startPanel();
+                  }
+              }
+
+              private void refresh() {
+                  status.setText("Overlay permission: " + Settings.canDrawOverlays(this));
+                  hTv.setText("Panel height: " + p.getInt("height", 170) + " dp");
+                  sTv.setText("Side margin (knob clearance): " + p.getInt("side", 200) + " dp");
+                  bootBtn.setText("Auto-start on boot: " + (p.getBoolean("boot", true) ? "ON" : "OFF"));
+                  logTv.setText("Event log (newest first):\n" + p.getString("log", "(empty)"));
+              }
+
+              private void askOverlay() {
+                  try {
+                      startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                              Uri.parse("package:" + getPackageName())));
+                  } catch (ActivityNotFoundException e) {
+                      Toast.makeText(this,
+                              "No overlay settings screen. Try Settings > Apps > Bottom Panel > Display over other apps",
+                              Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void startPanel() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      Toast.makeText(this, "Grant overlay permission first (button 1)", Toast.LENGTH_LONG).show();
+                      return;
+                  }
+                  startForegroundService(new Intent(this, PanelService.class));
+              }
+
+              private void stopPanel() {
+                  p.edit().putBoolean("wanted", false).apply();
+                  PanelService.cancelPing(this);
+                  stopService(new Intent(this, PanelService.class));
+                  PanelService.log(this, "stopped by user");
+                  refresh();
+              }
+          }
+          EOF
+
+      - name: Build APK
+        working-directory: panel
+        run: gradle assembleDebug --no-daemon
+
+      - name: List built files
+        run: ls -l panel/app/build/outputs/apk/debug/
+
+      - name: Upload APK as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottom-panel-apk
+          path: panel/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publish APK as a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: panel-${{ github.run_number }}
+          name: Bottom Panel APK ${{ github.run_number }}
+          files: panel/app/build/outputs/apk/debug/app-debug.apk
+          fail_on_unmatched_files: true
