@@ -1,6 +1,137 @@
-<html>
-<style>
-   div{min-height:1em;}
-</style>
-<body>name: Build bottom panel APK<br/><br/>&#39;on&#39;:<br/>  push:<br/>    branches:<br/>      - main<br/>  workflow_dispatch:<br/><br/>permissions:<br/>  contents: write<br/><br/>jobs:<br/>  build:<br/>    runs-on: ubuntu-latest<br/><br/>    steps:<br/>      - name: Checkout repository<br/>        uses: actions/checkout@v4<br/><br/>      - name: Set up Java<br/>        uses: actions/setup-java@v4<br/>        with:<br/>          distribution: temurin<br/>          java-version: &#39;17&#39;<br/><br/>      - name: Set up Gradle<br/>        uses: gradle/actions/setup-gradle@v4<br/><br/>      - name: Create Android project<br/>        shell: bash<br/>        env:<br/>          BUILD_NUMBER: ${{ github.run_number }}<br/>        run: |<br/>          set -euo pipefail<br/><br/>          mkdir -p panel/app/src/main/java/com/example/panel<br/>          mkdir -p panel/app/src/main/res/xml<br/>          mkdir -p panel/app/src/main/res/values<br/><br/>          cd panel<br/><br/>          cat &gt; settings.gradle &lt;&lt;&#39;EOF&#39;<br/>          pluginManagement {<br/>              repositories {<br/>                  google()<br/>                  mavenCentral()<br/>                  gradlePluginPortal()<br/>              }<br/>          }<br/>          dependencyResolutionManagement {<br/>              repositories {<br/>                  google()<br/>                  mavenCentral()<br/>              }<br/>          }<br/>          rootProject.name = &quot;Panel&quot;<br/>          include &#39;:app&#39;<br/>          EOF<br/><br/>          cat &gt; build.gradle &lt;&lt;&#39;EOF&#39;<br/>          plugins {<br/>              id &#39;com.android.application&#39; version &#39;8.2.2&#39; apply false<br/>          }<br/>          EOF<br/><br/>          cat &gt; app/build.gradle &lt;&lt;&#39;EOF&#39;<br/>          plugins {<br/>              id &#39;com.android.application&#39;<br/>          }<br/><br/>          android {<br/>              namespace &#39;com.example.panel&#39;<br/>              compileSdk 34<br/><br/>              defaultConfig {<br/>                  applicationId &#39;com.example.panel&#39;<br/>                  minSdk 29<br/>                  targetSdk 29<br/>                  versionCode 1<br/>                  versionName &#39;1.5&#39;<br/>              }<br/><br/>              compileOptions {<br/>                  sourceCompatibility JavaVersion.VERSION_17<br/>                  targetCompatibility JavaVersion.VERSION_17<br/>              }<br/>          }<br/>          EOF<br/><br/>          cat &gt; app/src/main/res/values/strings.xml &lt;&lt;&#39;EOF&#39;<br/>          &lt;resources&gt;<br/>              &lt;string name=&quot;app_name&quot;&gt;Bottom Panel&lt;/string&gt;<br/>              &lt;string name=&quot;accessibility_desc&quot;&gt;Keeps the bottom panel alive and displays it automatically after sleep.&lt;/string&gt;<br/>          &lt;/resources&gt;<br/>          EOF<br/><br/>          cat &gt; app/src/main/res/xml/accessibility_service_config.xml &lt;&lt;&#39;EOF&#39;<br/>          &lt;?xml version=&quot;1.0&quot; encoding=&quot;utf-8&quot;?&gt;<br/>          &lt;accessibility-service xmlns:android=&quot;http://schemas.android.com/apk/res/android&quot;<br/>              android:accessibilityEventTypes=&quot;typeWindowStateChanged&quot;<br/>              android:accessibilityFeedbackType=&quot;feedbackGeneric&quot;<br/>              android:accessibilityFlags=&quot;flagDefault&quot;<br/>              android:canRetrieveWindowContent=&quot;false&quot;<br/>              android:description=&quot;@string/accessibility_desc&quot;<br/>              android:notificationTimeout=&quot;100&quot; /&gt;<br/>          EOF<br/><br/>          # IMPORTANT:<br/>          # Add the complete AndroidManifest.xml and the four Java files<br/>          # from your existing working project here:<br/>          # MainActivity.java<br/>          # AppsActivity.java<br/>          # PanelService.java<br/>          # BootReceiver.java<br/>          # PanelAccessibilityService.java<br/><br/>      - name: Build APK<br/>        working-directory: panel<br/>        run: |<br/>          gradle --version<br/>          gradle assembleDebug --no-daemon<br/><br/>      - name: Upload APK<br/>        uses: actions/upload-artifact@v4<br/>        with:<br/>          name: bottom-panel-apk<br/>          path: panel/app/build/outputs/apk/debug/app-debug.apk<br/>          if-no-files-found: error<br/><br/>      - name: Publish APK as a release<br/>        if: success()<br/>        uses: softprops/action-gh-release@v2<br/>        with:<br/>          tag_name: panel-${{ github.run_number }}<br/>          name: Bottom Panel APK ${{ github.run_number }}<br/>          files: panel/app/build/outputs/apk/debug/app-debug.apk<br/>          fail_on_unmatched_files: true</body>
-</html>
+name: Build bottom panel APK
+
+'on':
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Create Android project
+        shell: bash
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p panel/app/src/main/java/com/example/panel
+          mkdir -p panel/app/src/main/res/xml
+          mkdir -p panel/app/src/main/res/values
+
+          cd panel
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Panel"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.panel'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.example.panel'
+                  minSdk 29
+                  targetSdk 29
+                  versionCode 1
+                  versionName '1.5'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Bottom Panel</string>
+              <string name="accessibility_desc">Keeps the bottom panel alive and displays it automatically after sleep.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/accessibility_service_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="false"
+              android:description="@string/accessibility_desc"
+              android:notificationTimeout="100" />
+          EOF
+
+          # IMPORTANT:
+          # Add the complete AndroidManifest.xml and the four Java files
+          # from your existing working project here:
+          # MainActivity.java
+          # AppsActivity.java
+          # PanelService.java
+          # BootReceiver.java
+          # PanelAccessibilityService.java
+
+      - name: Build APK
+        working-directory: panel
+        run: |
+          gradle --version
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottom-panel-apk
+          path: panel/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Publish APK as a release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: panel-${{ github.run_number }}
+          name: Bottom Panel APK ${{ github.run_number }}
+          files: panel/app/build/outputs/apk/debug/app-debug.apk
+          fail_on_unmatched_files: true
